@@ -17,7 +17,9 @@ jobs:
                                   build-essential git cmake ninja-build zstd jq rsync
 
       - name: Bootstrap Zephyr (west + SDK)
-        run: ./extra/bootstrap.sh
+        run: |
+          set +o pipefail
+          yes | ./extra/bootstrap.sh
 
       - name: Applica export + conf EuraPortenta
         run: |
