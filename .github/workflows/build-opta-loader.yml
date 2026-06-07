@@ -23,8 +23,8 @@ jobs:
 
       - name: Applica export + conf EuraPortenta
         run: |
-          cat eura/eura_llext_exports.c >> loader/llext_exports.c
-          cat eura/eura_opta.conf >> variants/arduino_opta_stm32h747xx_m7/arduino_opta_stm32h747xx_m7.conf
+          cat eura_llext_exports.c >> loader/llext_exports.c
+          cat eura_opta.conf >> variants/arduino_opta_stm32h747xx_m7/arduino_opta_stm32h747xx_m7.conf
 
       - name: Build loader per Opta
         run: ./extra/build.sh opta
