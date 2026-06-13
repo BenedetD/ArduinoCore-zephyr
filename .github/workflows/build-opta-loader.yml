@@ -1,5 +1,18 @@
 name: Build Opta loader (EuraPortenta)
 
+# Compila il loader Arduino-Zephyr per Arduino Opta con gli export aggiuntivi
+# richiesti da EuraPortenta (mbedTLS/net/errno/SNTP), su runner Linux GitHub.
+# Nessun Linux locale necessario: si scarica l'artifact e si flasha da Windows.
+#
+# USO:
+#  1. Fai un fork di https://github.com/arduino/ArduinoCore-zephyr (branch/tag 0.55.2).
+#  2. Nel fork crea la cartella  eura/  e copiaci dentro:
+#         eura/eura_llext_exports.c   (da loader_rebuild/)
+#         eura/eura_opta.conf         (da loader_rebuild/)
+#  3. Copia questo file in  .github/workflows/build-opta-loader.yml
+#  4. GitHub -> tab Actions -> "Build Opta loader (EuraPortenta)" -> Run workflow.
+#  5. A fine build scarica l'artifact "opta-loader" (contiene i firmwares/).
+
 on:
   workflow_dispatch:
 
@@ -23,19 +36,43 @@ jobs:
 
       - name: Applica export + conf EuraPortenta
         run: |
+          echo ">> Accodo gli EXPORT_SYMBOL al loader"
           cat eura_llext_exports.c >> loader/llext_exports.c
+          echo ">> Accodo i CONFIG alla variante Opta"
           cat eura_opta.conf >> variants/arduino_opta_stm32h747xx_m7/arduino_opta_stm32h747xx_m7.conf
 
       - name: Build loader per Opta
-        run: ./extra/build.sh opta
+        run: |
+          # build.sh gestisce venv/west internamente (vedi README del core).
+          ./extra/build.sh opta
+
+      - name: Raccogli artefatti di analisi (.config / .map / .dts)
+        if: always()
+        run: |
+          mkdir -p analysis
+          # Le posizioni esatte dipendono dalla build dir di build.sh: cerchiamo
+          # ovunque e copiamo appiattendo i nomi (prefisso con la dir genitore).
+          echo ">> Cerco .config / zephyr.map / zephyr.dts sotto l'albero di build"
+          find . -type f \( -name '.config' -o -name 'zephyr.map' -o -name 'zephyr.dts' \
+                            -o -name '*.map' -o -name 'ram_report' -o -name 'rom_report' \) \
+                 -path '*build*' 2>/dev/null | while read -r f; do
+            safe=$(echo "$f" | sed 's#^\./##; s#/#__#g')
+            cp -v "$f" "analysis/$safe" || true
+          done
+          echo ">> Genero ram_report/rom_report se possibile (best effort)"
+          BUILD_DIR=$(dirname "$(find . -name '.config' -path '*build*' 2>/dev/null | head -n1)")
+          echo "BUILD_DIR=$BUILD_DIR"
+          ls -la analysis || true
 
       - name: Carica i firmware come artifact
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: opta-loader
-          if-no-files-found: error
+          if-no-files-found: warn
           path: |
             firmwares/zephyr-arduino_opta_stm32h747xx_m7.bin
             firmwares/zephyr-arduino_opta_stm32h747xx_m7.elf
             firmwares/zephyr-arduino_opta_stm32h747xx_m7.hex
             variants/arduino_opta_stm32h747xx_m7/**
+            analysis/**
