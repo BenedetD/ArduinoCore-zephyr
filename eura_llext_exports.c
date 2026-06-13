@@ -399,3 +399,22 @@ FORCE_EXPORT_SYM(mbedtls_ctr_drbg_init)
 FORCE_EXPORT_SYM(mbedtls_ctr_drbg_free)
 FORCE_EXPORT_SYM(mbedtls_ctr_drbg_seed)
 FORCE_EXPORT_SYM(mbedtls_ctr_drbg_random)
+
+/* --- MQTT nativo Zephyr (CONFIG_MQTT_LIB=y) ---
+ * Richiede CONFIG_MQTT_LIB=y + CONFIG_NET_BUF=y in eura_opta.conf.
+ * Consente di sostituire ArduinoMqttClient con il client MQTT Zephyr nativo,
+ * eliminando i problemi di framing TCP (endMessage) e keepalive. */
+EXPORT_SYMBOL(mqtt_client_init)
+EXPORT_SYMBOL(mqtt_connect)
+EXPORT_SYMBOL(mqtt_disconnect)
+EXPORT_SYMBOL(mqtt_abort)
+EXPORT_SYMBOL(mqtt_publish)
+EXPORT_SYMBOL(mqtt_subscribe)
+EXPORT_SYMBOL(mqtt_unsubscribe)
+EXPORT_SYMBOL(mqtt_ping)
+EXPORT_SYMBOL(mqtt_input)
+EXPORT_SYMBOL(mqtt_live)
+/* net_buf: necessario per costruire mqtt_publish_param.message.payload */
+EXPORT_SYMBOL(net_buf_alloc_fixed)
+EXPORT_SYMBOL(net_buf_unref)
+EXPORT_SYMBOL(net_buf_simple_init_with_data)
