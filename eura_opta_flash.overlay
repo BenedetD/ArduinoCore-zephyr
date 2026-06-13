@@ -1,0 +1,20 @@
+/*
+ * eura_opta_flash.overlay — Allarga la partizione sketch su flash interna Opta.
+ *
+ * Stock Arduino-Zephyr 0.55.2:
+ *   user_sketch @ 0x080E0000, size 0x40000 (256 KiB)  → _sketch_max_size in syms-static.ld
+ *
+ * Mbed monolitico usava molto più flash (tip. 600 KiB–1 MiB+). Per parità serve
+ * almeno 512 KiB–1 MiB. Qui: 1 MiB (0x100000), resta entro i 2 MiB bank1.
+ *
+ * Applicare al rebuild loader (accodare al variant overlay o includere nel fork):
+ *   variants/arduino_opta_stm32h747xx_m7/arduino_opta_stm32h747xx_m7.overlay
+ * Poi rebuild loader + eura_apply.ps1 → syms-static.ld aggiorna _sketch_max_size.
+ */
+&flash0 {
+	partitions {
+		user_sketch: partition@e0000 {
+			reg = <0x000E0000 0x00100000>;
+		};
+	};
+};
