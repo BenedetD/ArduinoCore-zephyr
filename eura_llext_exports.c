@@ -416,4 +416,7 @@ FORCE_EXPORT_SYM(mqtt_unsubscribe)
 FORCE_EXPORT_SYM(mqtt_ping)
 FORCE_EXPORT_SYM(mqtt_input)
 FORCE_EXPORT_SYM(mqtt_live)
+FORCE_EXPORT_SYM(mqtt_read_publish_payload)
+FORCE_EXPORT_SYM(mqtt_read_publish_payload_blocking)
+FORCE_EXPORT_SYM(mqtt_publish_qos1_ack)
 /* net_buf non necessario: mqtt_publish accetta puntatore+len diretto */
