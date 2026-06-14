@@ -7,8 +7,9 @@ name: Build Opta loader (EuraPortenta)
 # USO:
 #  1. Fai un fork di https://github.com/arduino/ArduinoCore-zephyr (branch/tag 0.55.2).
 #  2. Nel fork crea la cartella  eura/  e copiaci dentro:
-#         eura/eura_llext_exports.c   (da loader_rebuild/)
-#         eura/eura_opta.conf         (da loader_rebuild/)
+#         eura/eura_llext_exports.c      (da loader_rebuild/)
+#         eura/eura_opta.conf            (da loader_rebuild/)
+#         eura/eura_opta_flash.overlay   (da loader_rebuild/)  <- allarga user_sketch a 1 MiB
 #  3. Copia questo file in  .github/workflows/build-opta-loader.yml
 #  4. GitHub -> tab Actions -> "Build Opta loader (EuraPortenta)" -> Run workflow.
 #  5. A fine build scarica l'artifact "opta-loader" (contiene i firmwares/).
@@ -40,6 +41,39 @@ jobs:
           cat eura_llext_exports.c >> loader/llext_exports.c
           echo ">> Accodo i CONFIG alla variante Opta"
           cat eura_opta.conf >> variants/arduino_opta_stm32h747xx_m7/arduino_opta_stm32h747xx_m7.conf
+          echo ">> Allarga user_sketch a 1 MiB nell'overlay Opta"
+          cat eura_opta_flash.overlay >> variants/arduino_opta_stm32h747xx_m7/arduino_opta_stm32h747xx_m7.overlay
+
+      - name: Integra modulo FOTA apply (Fase 3-B)
+        run: |
+          set -e
+          # I sorgenti eura possono stare nella root del fork o nella sottocartella eura/.
+          SRC_DIR="."
+          if [ -f eura/eura_fota_apply.c ]; then SRC_DIR="eura"; fi
+          if [ ! -f "$SRC_DIR/eura_fota_apply.c" ]; then
+            echo "ERRORE: eura_fota_apply.c non trovato (ne' in ./ ne' in eura/)."
+            exit 1
+          fi
+          echo ">> Copio il modulo FOTA apply in loader/ (auto-globbed da CMakeLists: FILE(GLOB *.c))"
+          cp "$SRC_DIR/eura_fota_apply.c" loader/eura_fota_apply.c
+          cp "$SRC_DIR/eura_fota_apply.h" loader/eura_fota_apply.h
+
+          echo ">> Patch loader/main.c: #include dopo LOG_MODULE_REGISTER(sketch);"
+          if ! grep -q 'eura_fota_apply.h' loader/main.c; then
+            sed -i 's@\(LOG_MODULE_REGISTER(sketch);\)@\1\n#include "eura_fota_apply.h"@' loader/main.c
+          fi
+
+          echo ">> Patch loader/main.c: chiamata come PRIMA istruzione di loader()"
+          if ! grep -q 'eura_fota_apply_pending' loader/main.c; then
+            perl -0pi -e 's/(static int loader\(const struct shell \*sh\) \{)/$1\n\t(void)eura_fota_apply_pending();/' loader/main.c
+          fi
+
+          echo ">> Verifica patch applicate:"
+          grep -n 'eura_fota_apply' loader/main.c
+          if [ "$(grep -c 'eura_fota_apply' loader/main.c)" -lt 2 ]; then
+            echo "ERRORE: patch main.c incompleta (attese >= 2 occorrenze: include + chiamata)."
+            exit 1
+          fi
 
       - name: Build loader per Opta
         run: |
