@@ -22,8 +22,9 @@
  * =============================================================================
  */
 
-/* ===> Test 1 del FASE3B_APPLY.md: lasciare DEFINITO finche' non validato su banco. */
-#define EURA_FOTA_DRYRUN 1
+/* ===> APPLY REALE abilitato (due passate). Per tornare al dry-run di sicurezza
+ *      (nessuna scrittura flash) ridefinire EURA_FOTA_DRYRUN a 1.            */
+/* #define EURA_FOTA_DRYRUN 1 */
 
 #include <zephyr/kernel.h>
 #include <zephyr/storage/flash_map.h>
@@ -112,6 +113,111 @@ static void eura_write_verdict(const char *s)
 	}
 }
 
+/* Buffer condiviso fra le passate (loader monothread: nessuna rientranza). */
+static uint8_t eura_buf[EURA_BUF];
+
+/* ---------------------------------------------------------------------------
+ * PASSATA 1: legge l'INTERA immagine dal file e calcola lo SHA256, SENZA MAI
+ * toccare la flash interna. Serve a validare il pending prima di qualunque
+ * erase/write: se qui fallisce, lo user_sketch corrente resta intatto.
+ *   0  = SHA combacia col marker
+ *  -1  = open file fallita
+ *  -2  = lettura corta / errore I/O
+ *  -3  = SHA non combacia
+ * ------------------------------------------------------------------------- */
+static int eura_pass1_verify(const uint8_t want_sha[32], size_t img)
+{
+	struct fs_file_t bf;
+	fs_file_t_init(&bf);
+	if (fs_open(&bf, EURA_STAGED_BIN, FS_O_READ) != 0) {
+		return -1;
+	}
+
+	mbedtls_sha256_context sha;
+	mbedtls_sha256_init(&sha);
+	mbedtls_sha256_starts(&sha, 0);
+
+	size_t off = 0;
+	int rc = 0;
+	while (off < img) {
+		int rd = fs_read(&bf, eura_buf, sizeof(eura_buf));
+		if (rd <= 0) { rc = -2; break; }
+		mbedtls_sha256_update(&sha, eura_buf, (size_t)rd);
+		off += (size_t)rd;
+	}
+	fs_close(&bf);
+
+	uint8_t got_sha[32];
+	mbedtls_sha256_finish(&sha, got_sha);
+	mbedtls_sha256_free(&sha);
+
+	if (rc != 0 || off != img) return -2;
+	if (memcmp(got_sha, want_sha, 32) != 0) return -3;
+	return 0;
+}
+
+/* ---------------------------------------------------------------------------
+ * PASSATA 2: erase di user_sketch, riscrittura dell'immagine dal file e
+ * READ-BACK dalla flash con ricalcolo SHA (verifica cio' che e' realmente
+ * finito sul silicio, non cio' che credevamo di scrivere).
+ *   0  = scritto e riletto OK
+ *  -1  = erase fallito
+ *  -2  = open file fallita
+ *  -3  = write fallita / lettura corta
+ *  -4  = read-back fallito
+ *  -5  = SHA read-back non combacia
+ * ------------------------------------------------------------------------- */
+static int eura_pass2_write(const struct flash_area *fa,
+                            const uint8_t want_sha[32], size_t img)
+{
+	if (flash_area_erase(fa, 0, fa->fa_size) != 0) {
+		return -1;
+	}
+
+	struct fs_file_t bf;
+	fs_file_t_init(&bf);
+	if (fs_open(&bf, EURA_STAGED_BIN, FS_O_READ) != 0) {
+		return -2;
+	}
+
+	size_t off = 0;
+	int rc = 0;
+	while (off < img) {
+		int rd = fs_read(&bf, eura_buf, sizeof(eura_buf));
+		if (rd <= 0) { rc = -3; break; }
+		/* Padding a EURA_WBS: corretto perche' solo l'ULTIMO read e' parziale
+		 * (EURA_BUF=4096 e' multiplo di EURA_WBS). I read intermedi sono pieni. */
+		size_t w = (size_t)rd;
+		if (w % EURA_WBS) {
+			size_t pad = EURA_WBS - (w % EURA_WBS);
+			memset(eura_buf + w, 0xFF, pad);
+			w += pad;
+		}
+		if (flash_area_write(fa, off, eura_buf, w) != 0) { rc = -3; break; }
+		off += (size_t)rd;
+	}
+	fs_close(&bf);
+	if (rc != 0 || off != img) return (rc != 0) ? rc : -3;
+
+	/* READ-BACK: rileggi dalla flash e ricalcola lo SHA sull'immagine reale. */
+	mbedtls_sha256_context sha;
+	mbedtls_sha256_init(&sha);
+	mbedtls_sha256_starts(&sha, 0);
+	off = 0;
+	while (off < img) {
+		size_t chunk = (img - off < EURA_BUF) ? (img - off) : EURA_BUF;
+		if (flash_area_read(fa, off, eura_buf, chunk) != 0) { rc = -4; break; }
+		mbedtls_sha256_update(&sha, eura_buf, chunk);
+		off += chunk;
+	}
+	uint8_t got_sha[32];
+	mbedtls_sha256_finish(&sha, got_sha);
+	mbedtls_sha256_free(&sha);
+	if (rc != 0) return rc;
+	if (memcmp(got_sha, want_sha, 32) != 0) return -5;
+	return 0;
+}
+
 /* Ritorna 0 = applicato o niente-da-fare; <0 = abort sicuro (prosegue boot normale). */
 int eura_fota_apply_pending(void)
 {
@@ -180,97 +286,53 @@ int eura_fota_apply_pending(void)
 		goto out_unmount;
 	}
 
-	/* Lettura file + SHA incrementale (NON scrive flash in dry-run). */
-	struct fs_file_t bf;
-	fs_file_t_init(&bf);
-	if (fs_open(&bf, EURA_STAGED_BIN, FS_O_READ) != 0) {
-		printk("[EURA-FOTA] open .bin fallita -> skip\n");
-		snprintf(verdict, sizeof(verdict), "FAIL: open pending_sketch.bin\n");
-		flash_area_close(fa);
-		result = -1;
-		goto out_unmount;
-	}
-
-	mbedtls_sha256_context sha;
-	mbedtls_sha256_init(&sha);
-	mbedtls_sha256_starts(&sha, 0);
-
-	int rc = 0;
-
-#if !defined(EURA_FOTA_DRYRUN)
-	/* ----- APPLY REALE: erase UNA volta prima del loop (8 settori da 128 KB). ----- */
-	if (flash_area_erase(fa, 0, fa->fa_size) != 0) {
-		printk("[EURA-FOTA] erase fallito\n");
-		snprintf(verdict, sizeof(verdict), "FAIL: erase user_sketch\n");
-		fs_close(&bf);
-		mbedtls_sha256_free(&sha);
-		flash_area_close(fa);
-		result = -1;
-		goto out_unmount;
-	}
-#endif
-
-	static uint8_t buf[EURA_BUF];
-	size_t off = 0;
-	while (off < img) {
-		int rd = fs_read(&bf, buf, sizeof(buf));
-		if (rd <= 0) { rc = -1; break; }
-		mbedtls_sha256_update(&sha, buf, (size_t)rd);
-
-#if !defined(EURA_FOTA_DRYRUN)
-		/* ----- APPLY REALE (disattivato in dry-run) ----- */
-		/* ATTENZIONE BANCO: il padding a EURA_WBS e' corretto SOLO se i read
-		 * intermedi sono multipli di EURA_WBS (LittleFS con EURA_BUF=4096 lo e':
-		 * solo l'ULTIMO read e' parziale). Se un read intermedio fosse parziale,
-		 * la riscrittura successiva colpirebbe una flash-word gia' programmata
-		 * -> errore ECC. In tal caso accumulare in un buffer allineato a EURA_WBS. */
-		size_t w = (size_t)rd;
-		if (w % EURA_WBS) {
-			size_t pad = EURA_WBS - (w % EURA_WBS);
-			memset(buf + w, 0xFF, pad);
-			w += pad;
-		}
-		if (flash_area_write(fa, off, buf, w) != 0) { rc = -1; break; }
-#endif
-		off += (size_t)rd;
-	}
-	fs_close(&bf);
-
-	uint8_t got_sha[32];
-	mbedtls_sha256_finish(&sha, got_sha);
-	mbedtls_sha256_free(&sha);
-
-	const bool sha_ok = (rc == 0) && (off == img) &&
-	                    (memcmp(got_sha, want_sha, 32) == 0);
-
-	flash_area_close(fa);
-
-	if (!sha_ok) {
-		printk("[EURA-FOTA] VERIFICA FALLITA (rc=%d off=%zu/%zu sha_match=%d)\n",
-		       rc, off, img, (rc == 0 && off == img) ?
-		       (memcmp(got_sha, want_sha, 32) == 0) : 0);
+	/* ===================================================================== *
+	 *  PASSATA 1 - VERIFICA (nessuna scrittura flash)                       *
+	 *  Legge tutto il file e confronta lo SHA col marker. Se fallisce qui,  *
+	 *  lo user_sketch attuale NON viene toccato: boot normale.              *
+	 * ===================================================================== */
+	int p1 = eura_pass1_verify(want_sha, img);
+	if (p1 != 0) {
+		printk("[EURA-FOTA] PASSATA1 verifica fallita rc=%d -> skip (nessuna scrittura)\n", p1);
 		snprintf(verdict, sizeof(verdict),
-		        "FAIL: verifica (rc=%d letti=%zu/%zu sha_match=%d)\n",
-		        rc, off, img, (rc == 0 && off == img) ?
-		        (memcmp(got_sha, want_sha, 32) == 0) : 0);
+		        "FAIL: passata1 verifica SHA (rc=%d) - nessuna scrittura\n", p1);
+		flash_area_close(fa);
 		result = -1;
 		goto out_unmount;
 	}
+	printk("[EURA-FOTA] PASSATA1 OK: img=%zu byte, SHA match (nessuna scrittura).\n", img);
 
 #if defined(EURA_FOTA_DRYRUN)
+	/* DRY-RUN: ci fermiamo dopo la verifica, senza toccare la flash. */
 	printk("[EURA-FOTA] DRY-RUN OK: pending valido, SHA match, guardia OK. "
 	       "NESSUNA scrittura eseguita.\n");
 	snprintf(verdict, sizeof(verdict),
 	        "DRY-RUN OK: img=%zu byte, SHA match, guardia OK. Nessuna scrittura.\n", img);
 	/* In dry-run NON rimuoviamo il pending: cosi' resta per i test ripetuti. */
+	flash_area_close(fa);
 	result = 0;
 #else
-	/* APPLY REALE: rimuovi pending solo dopo verifica SHA OK. */
+	/* ===================================================================== *
+	 *  PASSATA 2 - APPLY REALE (solo se PASSATA 1 OK)                        *
+	 *  Erase -> write -> READ-BACK con ricalcolo SHA dalla flash.           *
+	 * ===================================================================== */
+	int p2 = eura_pass2_write(fa, want_sha, img);
+	flash_area_close(fa);
+	if (p2 != 0) {
+		printk("[EURA-FOTA] PASSATA2 apply fallita rc=%d\n", p2);
+		snprintf(verdict, sizeof(verdict), "FAIL: passata2 apply (rc=%d)\n", p2);
+		/* NON rimuoviamo il pending: si potra' ritentare al prossimo boot. */
+		result = -1;
+		goto out_unmount;
+	}
+
+	/* APPLY REALE riuscito: rimuovi pending solo dopo read-back SHA OK. */
 	fs_unlink(EURA_STAGED_BIN);
 	fs_unlink(EURA_STAGED_META);
 	fs_unlink(EURA_APPLYING);
-	printk("[EURA-FOTA] applicato (%zu byte, SHA OK) -> boot nuovo sketch\n", img);
-	snprintf(verdict, sizeof(verdict), "APPLIED: img=%zu byte, SHA OK -> nuovo sketch\n", img);
+	printk("[EURA-FOTA] applicato (%zu byte, read-back SHA OK) -> boot nuovo sketch\n", img);
+	snprintf(verdict, sizeof(verdict),
+	        "APPLIED: img=%zu byte, read-back SHA OK -> nuovo sketch\n", img);
 	result = 0;
 #endif
 
