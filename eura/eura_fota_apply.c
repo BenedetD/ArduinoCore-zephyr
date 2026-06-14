@@ -43,6 +43,7 @@
 #define EURA_STAGED_BIN   EURA_MNT "/pending_sketch.bin"
 #define EURA_STAGED_META  EURA_MNT "/pending_sketch.json"
 #define EURA_APPLYING     EURA_MNT "/pending_sketch.applying"
+#define EURA_VERDICT_FILE EURA_MNT "/eura_fota_dryrun.txt"
 
 #define EURA_US_OFF       0x000E0000u   /* user_sketch offset atteso (flash interna) */
 #define EURA_US_SIZE      0x00100000u   /* user_sketch size attesa (1 MiB)           */
@@ -98,6 +99,19 @@ static int parse_marker_sha(uint8_t out[32])
 	return 0;
 }
 
+/* Scrive il verdetto su file (stessa partizione che lo sketch monta su /fs), cosi'
+ * l'esito e' leggibile sulla USB anche se il printk del loader va su usart6. */
+static void eura_write_verdict(const char *s)
+{
+	fs_unlink(EURA_VERDICT_FILE);
+	struct fs_file_t vf;
+	fs_file_t_init(&vf);
+	if (fs_open(&vf, EURA_VERDICT_FILE, FS_O_CREATE | FS_O_WRITE) == 0) {
+		fs_write(&vf, s, strlen(s));
+		fs_close(&vf);
+	}
+}
+
 /* Ritorna 0 = applicato o niente-da-fare; <0 = abort sicuro (prosegue boot normale). */
 int eura_fota_apply_pending(void)
 {
@@ -108,14 +122,19 @@ int eura_fota_apply_pending(void)
 	}
 
 	int result = 0;
+	char verdict[160];
+	bool write_verdict = false;
 	struct fs_dirent meta_ent, bin_ent;
 
 	if (fs_stat(EURA_STAGED_META, &meta_ent) != 0) {
-		/* nessun pending: caso normale, niente da fare */
+		/* nessun pending: caso normale, niente da fare (non scrivo verdetto) */
 		goto out_unmount;
 	}
+	/* da qui in poi c'e' un pending: scriveremo sempre un verdetto leggibile su /fs */
+	write_verdict = true;
 	if (fs_stat(EURA_STAGED_BIN, &bin_ent) != 0) {
 		printk("[EURA-FOTA] marker presente ma .bin assente -> skip\n");
+		snprintf(verdict, sizeof(verdict), "FAIL: marker presente ma pending_sketch.bin assente\n");
 		result = -1;
 		goto out_unmount;
 	}
@@ -123,6 +142,7 @@ int eura_fota_apply_pending(void)
 	const size_t img = (size_t)bin_ent.size;
 	if (img <= 16u || img > EURA_US_SIZE) {
 		printk("[EURA-FOTA] size fuori range (%zu) -> skip\n", img);
+		snprintf(verdict, sizeof(verdict), "FAIL: size fuori range (%zu byte)\n", img);
 		result = -1;
 		goto out_unmount;
 	}
@@ -130,6 +150,7 @@ int eura_fota_apply_pending(void)
 	const struct flash_area *fa;
 	if (flash_area_open(FIXED_PARTITION_ID(user_sketch), &fa) != 0) {
 		printk("[EURA-FOTA] flash_area_open(user_sketch) fallita -> skip\n");
+		snprintf(verdict, sizeof(verdict), "FAIL: flash_area_open(user_sketch)\n");
 		result = -1;
 		goto out_unmount;
 	}
@@ -138,6 +159,9 @@ int eura_fota_apply_pending(void)
 	if (fa->fa_off != EURA_US_OFF || fa->fa_size != EURA_US_SIZE || fa->fa_size < img) {
 		printk("[EURA-FOTA] ABORT guardia: off=%lx size=%zx img=%zu\n",
 		       (unsigned long)fa->fa_off, (size_t)fa->fa_size, img);
+		snprintf(verdict, sizeof(verdict),
+		        "ABORT guardia: off=%lx size=%zx img=%zu (atteso off=e0000 size=100000)\n",
+		        (unsigned long)fa->fa_off, (size_t)fa->fa_size, img);
 		flash_area_close(fa);
 		result = -2;
 		goto out_unmount;
@@ -150,6 +174,7 @@ int eura_fota_apply_pending(void)
 	bool have_sha = (parse_marker_sha(want_sha) == 0);
 	if (!have_sha) {
 		printk("[EURA-FOTA] SHA marker non parsabile -> skip\n");
+		snprintf(verdict, sizeof(verdict), "FAIL: SHA del marker non parsabile\n");
 		flash_area_close(fa);
 		result = -1;
 		goto out_unmount;
@@ -160,6 +185,7 @@ int eura_fota_apply_pending(void)
 	fs_file_t_init(&bf);
 	if (fs_open(&bf, EURA_STAGED_BIN, FS_O_READ) != 0) {
 		printk("[EURA-FOTA] open .bin fallita -> skip\n");
+		snprintf(verdict, sizeof(verdict), "FAIL: open pending_sketch.bin\n");
 		flash_area_close(fa);
 		result = -1;
 		goto out_unmount;
@@ -175,6 +201,7 @@ int eura_fota_apply_pending(void)
 	/* ----- APPLY REALE: erase UNA volta prima del loop (8 settori da 128 KB). ----- */
 	if (flash_area_erase(fa, 0, fa->fa_size) != 0) {
 		printk("[EURA-FOTA] erase fallito\n");
+		snprintf(verdict, sizeof(verdict), "FAIL: erase user_sketch\n");
 		fs_close(&bf);
 		mbedtls_sha256_free(&sha);
 		flash_area_close(fa);
@@ -222,6 +249,10 @@ int eura_fota_apply_pending(void)
 		printk("[EURA-FOTA] VERIFICA FALLITA (rc=%d off=%zu/%zu sha_match=%d)\n",
 		       rc, off, img, (rc == 0 && off == img) ?
 		       (memcmp(got_sha, want_sha, 32) == 0) : 0);
+		snprintf(verdict, sizeof(verdict),
+		        "FAIL: verifica (rc=%d letti=%zu/%zu sha_match=%d)\n",
+		        rc, off, img, (rc == 0 && off == img) ?
+		        (memcmp(got_sha, want_sha, 32) == 0) : 0);
 		result = -1;
 		goto out_unmount;
 	}
@@ -229,6 +260,8 @@ int eura_fota_apply_pending(void)
 #if defined(EURA_FOTA_DRYRUN)
 	printk("[EURA-FOTA] DRY-RUN OK: pending valido, SHA match, guardia OK. "
 	       "NESSUNA scrittura eseguita.\n");
+	snprintf(verdict, sizeof(verdict),
+	        "DRY-RUN OK: img=%zu byte, SHA match, guardia OK. Nessuna scrittura.\n", img);
 	/* In dry-run NON rimuoviamo il pending: cosi' resta per i test ripetuti. */
 	result = 0;
 #else
@@ -237,10 +270,14 @@ int eura_fota_apply_pending(void)
 	fs_unlink(EURA_STAGED_META);
 	fs_unlink(EURA_APPLYING);
 	printk("[EURA-FOTA] applicato (%zu byte, SHA OK) -> boot nuovo sketch\n", img);
+	snprintf(verdict, sizeof(verdict), "APPLIED: img=%zu byte, SHA OK -> nuovo sketch\n", img);
 	result = 0;
 #endif
 
 out_unmount:
+	if (write_verdict) {
+		eura_write_verdict(verdict);
+	}
 	fs_unmount(&eura_fota_mp);
 	return result;
 }
